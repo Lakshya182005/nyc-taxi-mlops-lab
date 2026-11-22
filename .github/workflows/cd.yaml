@@ -1,0 +1,80 @@
+# CD: deploy the image CI just built onto the app host, through the self-hosted runner there.
+# The runner uses the host's instance profile; no AWS keys anywhere.
+#
+# Triggered by workflow_run, so this file always runs from the default branch: a pull request can't
+# change what executes on your host. The `if` below also rejects CI runs that weren't pushes to
+# this repository; a fork's PR from a branch named "main" would otherwise match `branches: [main]`.
+name: cd
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag to deploy, e.g. to roll back (default sha-<first 7 of the commit>)
+        required: false
+      rollback:
+        description: Send traffic back to the other colour, which still runs the previous version (nothing is deployed)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: cd-app
+  cancel-in-progress: false
+
+jobs:
+  deploy-app:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: [self-hosted, lab-app]
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+      - uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Blue-green (decision 011): deploy to the idle colour, check it through Traefik, then switch.
+      # The previous colour keeps running, so a rollback is a switch back (workflow_dispatch, rollback).
+      - name: Blue-green deploy
+        if: ${{ !inputs.rollback }}
+        run: |
+          export IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tag="${TAG:-sha-${SHA::7}}"
+          deploy/web.sh prepare
+          live=$(deploy/web.sh live)
+          idle=$([ "$live" = blue ] && echo green || echo blue)
+          BLUE_TAG=$(deploy/web.sh tag blue) GREEN_TAG=$(deploy/web.sh tag green)
+          if [ "$idle" = blue ]; then BLUE_TAG=$tag; else GREEN_TAG=$tag; fi
+          export BLUE_TAG GREEN_TAG
+          docker compose -f deploy/compose.web.yaml pull "app-$idle"
+          docker compose -f deploy/compose.web.yaml up -d --wait --no-deps --remove-orphans "app-$idle"
+          # Switch only when the new colour answers through Traefik with the commit we built (or the tag
+          # asked for) and /predict works. Otherwise traffic stays where it is and the job fails.
+          if [ -n "$TAG" ]; then deploy/web.sh smoke "$idle"; else deploy/web.sh smoke "$idle" "$SHA"; fi
+          deploy/web.sh switch "$idle"
+          echo "### live: $idle ($tag); $live still runs $(deploy/web.sh tag "$live") for rollback" >> "$GITHUB_STEP_SUMMARY"
+      - name: Roll back to the other colour
+        if: ${{ inputs.rollback }}
+        run: |
+          live=$(deploy/web.sh live)
+          other=$([ "$live" = blue ] && echo green || echo blue)
+          [ "$(deploy/web.sh tag "$other")" != none ] || { echo "nothing to roll back to: $other isn't running" >&2; exit 1; }
+          deploy/web.sh smoke "$other"
+          deploy/web.sh switch "$other"
+          echo "### rolled back: live $other ($(deploy/web.sh tag "$other"))" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,67 @@
+# Promote a model version to champion: the only way `champion` moves (contracts/mlflow.yaml).
+# Gated by the `production` environment's required reviewers, so someone approves every promotion.
+# A rollback is the same workflow with the previous champion's version (recorded as the registered
+# model's previous_champion tag). Runs on the app host: it reaches MLflow on the platform host's
+# private IP, and reloads serving locally.
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to make champion (default the current challenger; for a rollback, the previous champion)
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: [self-hosted, lab-app]
+    environment: production
+    env:
+      M: ${{ vars.MLFLOW_TRACKING_URI }}/api/2.0/mlflow
+      NAME: trip-duration
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Check the version
+        run: |
+          v=${VERSION:-$(curl -fsS "$M/registered-models/alias?name=$NAME&alias=challenger" | jq -r .model_version.version)}
+          [[ "$v" =~ ^[0-9]+$ ]] || { echo "no version given and no challenger" >&2; exit 1; }
+          tags=$(curl -fsS "$M/model-versions/get?name=$NAME&version=$v" | jq -c '[.model_version.tags[]? | {(.key): .value}] | add // {}')
+          # Only a version the pipeline evaluated and gated (contracts/mlflow.yaml version_tags).
+          for t in training_window holdout_month features_version mae_min p95_latency_ms champion_mae_min; do
+            jq -e --arg t "$t" 'has($t)' <<<"$tags" >/dev/null || { echo "v$v lacks tag $t: not from the pipeline" >&2; exit 1; }
+          done
+          jq -e '(.mae_min | tonumber) < (.champion_mae_min | tonumber)' <<<"$tags" >/dev/null ||
+            { echo "v$v didn't beat what it was compared with" >&2; exit 1; }
+          old=$(curl -fsS "$M/registered-models/alias?name=$NAME&alias=champion" 2>/dev/null | jq -r '.model_version.version // empty' || true)
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          echo "OLD=${old:-none}" >> "$GITHUB_ENV"
+          echo "v$v: $(jq -r '"MAE \(.mae_min) vs \(.champion_mae_min), window \(.training_window), holdout \(.holdout_month)"' <<<"$tags")"
+      - name: Move champion
+        run: |
+          [ "$OLD" != "$VERSION" ] || { echo "v$VERSION is already champion"; exit 0; }
+          curl -fsS -X POST "$M/registered-models/set-tag" -H 'Content-Type: application/json' \
+            -d "$(jq -cn --arg n "$NAME" --arg v "$OLD" '{name: $n, key: "previous_champion", value: $v}')" >/dev/null
+          curl -fsS -X POST "$M/registered-models/alias" -H 'Content-Type: application/json' \
+            -d "$(jq -cn --arg n "$NAME" --arg v "$VERSION" '{name: $n, alias: "champion", version: $v}')" >/dev/null
+          echo "champion: v$OLD -> v$VERSION"
+      - name: Serve it
+        # Decision 010: hot reload. serving-champion keeps answering with the old version until the new
+        # one has loaded, so riders never see a gap. A restart would drop requests for the load time.
+        run: |
+          deploy/web.sh reload champion | tee /tmp/reload.json
+          jq -e --arg v "$VERSION" '.version == $v' /tmp/reload.json >/dev/null
+      - name: Smoke test
+        run: |
+          r=$(curl -fsS http://localhost/predict -H 'Content-Type: application/json' \
+            -d '{"pickup_zone_id": 132, "dropoff_zone_id": 230, "pickup_datetime": "2024-03-08T17:05:00"}')
+          echo "$r"
+          jq -e --arg v "$VERSION" '.model.version == $v and .model.alias == "champion"' <<<"$r" >/dev/null
+          echo "### champion: v$OLD -> v$VERSION (rollback: run promote with version $OLD)" >> "$GITHUB_STEP_SUMMARY"

@@ -1,39 +1,40 @@
-# S0: CI/CD on main.
-# Runs make check, builds linux/arm64 app image to GHCR, then deploys to the app host via self-hosted runner.
+# CI: run the grader's checks on every push and PR; on pushes to main, build the arm64 app image
+# on a GitHub-hosted arm64 runner (free for public repos) and push it to GHCR.
+# No AWS credentials: nothing here touches AWS.
 name: ci
 
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci
-  cancel-in-progress: false
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.2.0
       - uses: hashicorp/setup-terraform@v4.0.1
         with:
           terraform_version: 1.16.3
           terraform_wrapper: false
-      - uses: astral-sh/setup-uv@v10.2.0
       - run: make check
 
   image:
     needs: check
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
-    outputs:
-      tag: ${{ steps.img.outputs.tag }}
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Image name and tag
@@ -55,43 +56,5 @@ jobs:
           tags: ${{ steps.img.outputs.prefix }}/app:${{ steps.img.outputs.tag }}
           build-args: GIT_SHA=${{ github.sha }}
           labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-          cache-from: type=gha,scope=app
-          cache-to: type=gha,scope=app,mode=max
-
-  deploy:
-    needs: image
-    runs-on: [self-hosted, lab-app]
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: docker/login-action@v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Deploy app stack
-        run: |
-          export IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
-          export IMAGE_TAG="${{ needs.image.outputs.tag }}"
-          docker compose -f deploy/compose.app.yaml pull
-          docker compose -f deploy/compose.app.yaml up -d --wait
-      - name: Smoke test
-        run: |
-          echo "Waiting for /version to answer..."
-          for i in {1..15}; do
-            if curl -fsS http://localhost/version >/dev/null 2>&1; then
-              break
-            fi
-            echo "Waiting for Traefik routing to become active (attempt $i/15)..."
-            sleep 2
-          done
-          echo "Verifying /version..."
-          curl -fsS http://localhost/version
-          echo ""
-          echo "Verifying /predict..."
-          curl -fsS -X POST http://localhost/predict \
-            -H 'Content-Type: application/json' \
-            -d '{"pickup_zone_id": 132, "dropoff_zone_id": 230, "pickup_datetime": "2024-03-08T17:05:00"}'
-          echo ""
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
