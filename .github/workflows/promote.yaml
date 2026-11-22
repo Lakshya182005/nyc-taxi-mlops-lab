@@ -60,8 +60,16 @@ jobs:
           jq -e --arg v "$VERSION" '.version == $v' /tmp/reload.json >/dev/null
       - name: Smoke test
         run: |
-          r=$(curl -fsS http://localhost/predict -H 'Content-Type: application/json' \
-            -d '{"pickup_zone_id": 132, "dropoff_zone_id": 230, "pickup_datetime": "2024-03-08T17:05:00"}')
-          echo "$r"
-          jq -e --arg v "$VERSION" '.model.version == $v and .model.alias == "champion"' <<<"$r" >/dev/null
-          echo "### champion: v$OLD -> v$VERSION (rollback: run promote with version $OLD)" >> "$GITHUB_STEP_SUMMARY"
+          # Traefik health-checks serving on /model every 5s; retry until Traefik marks serving healthy
+          for _ in {1..10}; do
+            r=$(curl -fsS http://localhost/predict -H 'Content-Type: application/json' \
+              -d '{"pickup_zone_id": 132, "dropoff_zone_id": 230, "pickup_datetime": "2024-03-08T17:05:00"}')
+            echo "$r"
+            if jq -e --arg v "$VERSION" '.model.version == $v and .model.alias == "champion"' <<<"$r" >/dev/null 2>&1; then
+              echo "### champion: v$OLD -> v$VERSION (rollback: run promote with version $OLD)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Failed to verify champion model" >&2
+          exit 1
