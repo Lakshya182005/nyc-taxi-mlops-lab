@@ -79,6 +79,14 @@ jobs:
           docker compose -f deploy/compose.app.yaml up -d --wait
       - name: Smoke test
         run: |
+          echo "Waiting for /version to answer..."
+          for i in {1..15}; do
+            if curl -fsS http://localhost/version >/dev/null 2>&1; then
+              break
+            fi
+            echo "Waiting for Traefik routing to become active (attempt $i/15)..."
+            sleep 2
+          done
           echo "Verifying /version..."
           curl -fsS http://localhost/version
           echo ""
